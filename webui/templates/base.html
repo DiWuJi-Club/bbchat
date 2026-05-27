@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html class="dark" lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>{% block title %}bbchat 控制台{% endblock %}</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;600;700;800&amp;family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;700&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+  tailwind.config = {
+    darkMode: "class",
+    theme: {
+      extend: {
+        colors: {
+          "on-error": "#690005", "error-red": "#ffb4ab", "inverse-on-surface": "#2f3035",
+          "primary": "#dbe1ff", "on-primary-fixed-variant": "#354477", "surface-dim": "#111317",
+          "tertiary-fixed": "#ffdf94", "surface-bright": "#37393e", "tertiary": "#ffdf94",
+          "tertiary-container": "#e1c37b", "on-surface": "#e2e2e8", "outline-variant": "#45464f",
+          "inverse-primary": "#4d5c90", "on-tertiary-container": "#654f13",
+          "on-tertiary-fixed": "#251a00", "primary-fixed": "#dce1ff", "on-primary": "#1d2d5f",
+          "on-background": "#e2e2e8", "outline": "#8f909a", "surface-container-low": "#1a1c20",
+          "secondary": "#74db99", "surface-tint": "#b5c4ff", "surface-container-high": "#282a2e",
+          "primary-container": "#b5c4ff", "on-primary-container": "#415083",
+          "on-surface-variant": "#c3c5d7", "on-secondary-fixed-variant": "#00522c",
+          "on-tertiary": "#3e2e00", "secondary-fixed": "#90f8b3",
+          "surface-container-highest": "#333539", "on-tertiary-fixed-variant": "#584406",
+          "on-primary-fixed": "#041749", "on-secondary-container": "#d3ffdc",
+          "on-secondary": "#00391d", "primary-fixed-dim": "#b5c4ff",
+          "inverse-surface": "#e2e2e8", "error-container": "#93000a",
+          "background": "#111317", "surface": "#111317", "surface-container": "#1e2024",
+          "secondary-container": "#008048", "on-error-container": "#ffdad6",
+          "surface-variant": "#333539", "surface-container-lowest": "#0c0e12",
+          "error": "#ffb4ab", "on-secondary-fixed": "#00210f",
+          "tertiary-fixed-dim": "#e1c37b", "secondary-fixed-dim": "#74db99"
+        },
+        borderRadius: { "DEFAULT": "0.125rem", "lg": "0.25rem", "xl": "0.5rem", "full": "0.75rem" },
+        spacing: {
+          "panel-margin": "12px", "gutter": "8px", "unit": "4px",
+          "container-padding": "16px", "element-gap": "4px"
+        },
+        fontFamily: {
+          "headline-lg": ["Hanken Grotesk"], "headline-md": ["Hanken Grotesk"],
+          "body-sm": ["Inter"], "mono-sm": ["JetBrains Mono"],
+          "label-caps": ["JetBrains Mono"], "mono-md": ["JetBrains Mono"],
+          "body-md": ["Inter"]
+        },
+        fontSize: {
+          "headline-lg": ["20px", { "lineHeight": "28px", "fontWeight": "600" }],
+          "headline-md": ["16px", { "lineHeight": "24px", "fontWeight": "600" }],
+          "body-sm": ["12px", { "lineHeight": "16px", "fontWeight": "400" }],
+          "mono-sm": ["11px", { "lineHeight": "14px", "fontWeight": "400" }],
+          "label-caps": ["10px", { "lineHeight": "12px", "letterSpacing": "0.05em", "fontWeight": "700" }],
+          "mono-md": ["12px", { "lineHeight": "16px", "letterSpacing": "-0.01em", "fontWeight": "400" }],
+          "body-md": ["13px", { "lineHeight": "18px", "fontWeight": "400" }]
+        }
+      }
+    }
+  }
+</script>
+<style>
+  body { background-color: #111317; color: #e2e2e8; }
+  .glass-panel {
+    background-color: rgba(30, 32, 36, 0.7);
+    backdrop-filter: blur(12px);
+    border: 1px solid #434654;
+  }
+  .pulse-dot { animation: pulse 2s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(116, 219, 153, 0.4); }
+    70% { box-shadow: 0 0 0 4px rgba(116, 219, 153, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(116, 219, 153, 0); }
+  }
+  .term-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+  .term-scroll::-webkit-scrollbar-track { background: transparent; }
+  .term-scroll::-webkit-scrollbar-thumb { background: #45464f; border-radius: 3px; }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; z-index: 50;
+    background: #1e2024; color: #e2e2e8; padding: 10px 16px; border-radius: 4px;
+    border: 1px solid #45464f; font-size: 13px; max-width: 320px;
+    opacity: 0; transition: opacity 0.2s;
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { background: #93000a; border-color: #ffb4ab; color: #ffdad6; }
+</style>
+</head>
+<body class="flex h-screen overflow-hidden antialiased selection:bg-primary-container selection:text-on-primary-container">
+
+<!-- SideNavBar -->
+<nav class="flex flex-col h-full border-r border-outline-variant bg-surface-container-lowest h-screen w-64 flex-shrink-0 hidden md:flex">
+  <div class="p-container-padding border-b border-outline-variant flex items-center gap-3">
+    <div class="w-8 h-8 rounded bg-primary-container flex items-center justify-center">
+      <span class="material-symbols-outlined text-on-primary-container" style="font-variation-settings: 'FILL' 1;">dashboard</span>
+    </div>
+    <div>
+      <h1 class="font-mono-md text-mono-md font-bold text-secondary">BBCHAT</h1>
+      <p class="font-mono-sm text-mono-sm text-outline">Bumble Auto-Reply</p>
+    </div>
+  </div>
+  <div class="flex-1 overflow-y-auto py-2">
+    <a class="{% if active == 'overview' %}bg-secondary-container text-on-secondary-container{% else %}text-on-surface-variant hover:bg-surface-variant{% endif %} rounded-lg mx-2 my-1 px-3 py-2 flex items-center gap-3 group cursor-pointer transition-all duration-150 ease-in-out" href="/">
+      <span class="material-symbols-outlined">dashboard</span>
+      <span class="font-label-caps text-label-caps tracking-wider">Overview</span>
+    </a>
+    <a class="text-on-surface-variant hover:bg-surface-variant rounded-lg mx-2 my-1 px-3 py-2 flex items-center gap-3 group cursor-pointer transition-all duration-150 ease-in-out" href="https://github.com/DiWuJi-Club/bbchat" target="_blank" rel="noopener">
+      <span class="material-symbols-outlined">code</span>
+      <span class="font-label-caps text-label-caps tracking-wider">Repo</span>
+    </a>
+  </div>
+  <div class="p-4 border-t border-outline-variant space-y-2">
+    <div class="flex items-center gap-2 bg-surface-container-lowest px-2 py-1 rounded border border-outline-variant/50">
+      <span class="font-label-caps text-label-caps text-outline">GROUP</span>
+      <span class="font-mono-sm text-mono-sm text-primary" title="{{ default_group_id }}">{{ default_group_id[:8] }}…</span>
+    </div>
+    <div class="font-mono-sm text-mono-sm text-outline" id="health-ts">— ready —</div>
+  </div>
+</nav>
+
+<!-- Main -->
+<main class="flex-1 flex flex-col h-full overflow-hidden bg-background">
+  <header class="bg-surface-container border-b border-outline-variant sticky top-0 flex justify-between items-center w-full px-panel-margin py-unit max-w-full md:hidden">
+    <span class="font-headline-lg text-headline-lg font-bold text-primary tracking-tight">bbchat 控制台</span>
+  </header>
+  <header class="hidden md:flex justify-between items-center px-container-padding py-3 border-b border-outline-variant bg-surface-container glass-panel sticky top-0 z-10">
+    <div class="flex items-center gap-6">
+      <span class="font-headline-lg text-headline-lg font-bold text-primary tracking-tight">{% block heading %}bbchat 控制台{% endblock %}</span>
+      <nav class="flex gap-6">
+        <a class="font-headline-md text-headline-md text-primary border-b-2 border-primary pb-1" href="/">Fleet</a>
+      </nav>
+    </div>
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-2 bg-surface-container-lowest px-3 py-1 rounded border border-outline-variant/50">
+        <span class="font-label-caps text-label-caps text-outline">GROUP ID</span>
+        <span class="font-mono-sm text-mono-sm text-primary">{{ default_group_id }}</span>
+      </div>
+      <label class="flex items-center gap-2 text-on-surface-variant font-body-sm text-body-sm cursor-pointer">
+        <input type="checkbox" id="auto-refresh" checked class="rounded border-outline-variant bg-surface-container">
+        <span>5s 自动刷新</span>
+      </label>
+    </div>
+  </header>
+  <div class="flex-1 overflow-y-auto p-container-padding space-y-gutter relative">
+    {% block content %}{% endblock %}
+  </div>
+</main>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

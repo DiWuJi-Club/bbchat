@@ -25,6 +25,7 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
@@ -489,7 +490,10 @@ class GeelarkOpenAPIClient:
                 raise requests.Timeout(f"GeeLark API wall-clock timeout after {alarm_seconds:.1f}s")
 
             try:
-                if hasattr(signal, "SIGALRM"):
+                # SIGALRM-based wall-clock timeout only works from the main
+                # thread; when called from a Flask request thread or worker
+                # pool we fall back to the requests-level timeout alone.
+                if hasattr(signal, "SIGALRM") and threading.current_thread() is threading.main_thread():
                     old_alarm_handler = signal.getsignal(signal.SIGALRM)
                     old_alarm_timer = signal.setitimer(signal.ITIMER_REAL, 0)
                     signal.signal(signal.SIGALRM, _raise_wall_clock_timeout)
