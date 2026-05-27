@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local diagnostics and run artifacts
+diagnostics/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local Claude / agent state
+.claude/
