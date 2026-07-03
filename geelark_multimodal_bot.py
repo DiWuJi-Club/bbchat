@@ -2230,11 +2230,20 @@ def save_current_customer_snapshot(
             index,
         )
     else:
-        png = safe_screenshot_png(device)
-        (profile_dir / "screen.png").write_bytes(png)
-        save_png_crop(png, profile_dir / "photo.png", crop_bounds)
-        screen_name = "screen.png"
-        photo_name = "photo.png"
+        try:
+            png = safe_screenshot_png(device)
+            (profile_dir / "screen.png").write_bytes(png)
+            save_png_crop(png, profile_dir / "photo.png", crop_bounds)
+            screen_name = "screen.png"
+            photo_name = "photo.png"
+        except Exception as exc:
+            # A truncated screencap is a transient glitch; keep the loop
+            # alive and move on without this profile's photo.
+            LOGGER.warning(
+                "Customer screenshot failed for profile %s; continuing without photo: %s",
+                index,
+                exc,
+            )
 
     summary = {
         "index": index,
@@ -5410,6 +5419,31 @@ def _send_bumble_reply_parts(
         )
         typed_input_text = _chat_input_text_from_snapshot(typed)
         if safe_part.lower() not in typed_input_text.lower():
+            # Opening-Moves choosers can leave the composer unfocused on the
+            # first tap; refocus and retype once before giving up.
+            LOGGER.info(
+                "Typed text missing from input; refocusing composer and retyping part %s.",
+                idx,
+            )
+            refreshed = _collect_visible_text_snapshot(
+                device,
+                label=f"reply_part_{idx}_refocus",
+                output_dir=chat_dir,
+            )
+            retry_point = _find_chat_input_point(refreshed, screen_size)
+            human_gaussian_click(
+                device, retry_point[0], retry_point[1], sigma_px=7.0, max_offset_px=18
+            )
+            time.sleep(random.uniform(0.5, 0.9))
+            device.input_text(safe_part)
+            time.sleep(random.uniform(0.55, 1.05))
+            typed = _collect_visible_text_snapshot(
+                device,
+                label=f"reply_part_{idx}_typed_retry",
+                output_dir=chat_dir,
+            )
+            typed_input_text = _chat_input_text_from_snapshot(typed)
+        if safe_part.lower() not in typed_input_text.lower():
             raise ADBCommandError(
                 f"Reply part {idx} was not visible in the chat input after typing."
             )
@@ -6266,7 +6300,9 @@ def _process_your_matches_openers(
                     customer_profile_text="\n".join(chat_snapshot["texts"]),
                     conversation_text=(
                         "(brand-new match, no messages yet — send a short, natural "
-                        "opener based on the visible profile context)"
+                        f"opener based on the visible profile context; if you use a "
+                        f"name, address them only as {name!r} — other names in the "
+                        "visible text belong to other people)"
                     ),
                     chat_title=name,
                     image_path=None,
@@ -6469,10 +6505,18 @@ def run_bumble_chat_capture(
             self_profile_text, self_profile_source = _find_self_profile_text_for_phone(profile_id)
             if self_profile_text:
                 LOGGER.info("Using cached self profile for AI context: %s", self_profile_source)
-            if not self_profile_text and allow_global_self_profile_fallback:
-                self_profile_text, self_profile_source = _find_latest_self_profile_text()
             if not self_profile_text and capture_self_profile_for_ai:
+                # Capture this phone's own profile rather than borrowing
+                # another phone's cache via the global fallback.
                 self_profile_needs_capture = True
+            elif not self_profile_text and allow_global_self_profile_fallback:
+                self_profile_text, self_profile_source = _find_latest_self_profile_text()
+                if self_profile_text:
+                    LOGGER.warning(
+                        "Using another phone's cached self profile for AI context (%s); "
+                        "pass --capture-self-profile-for-ai to capture this phone's own.",
+                        self_profile_source,
+                    )
             summary["self_profile_source"] = self_profile_source
             summary["self_profile_text_count"] = len(
                 [line for line in self_profile_text.splitlines() if line.strip()]
