@@ -44,6 +44,20 @@ except ImportError:  # pragma: no cover - Python < 3.9 fallback.
 
 LOGGER = logging.getLogger("geelark_multimodal_bot")
 
+# Remote path used for `uiautomator dump` output on the cloud phone.
+_UI_DUMP_PATH = "/sdcard/window_dump.xml"
+
+# Ordered `uiautomator dump` variants: prefer the compressed dump, fall back to
+# the full dump if the compressed one yields nothing.
+_UIAUTOMATOR_DUMP_COMMANDS = (
+    f"uiautomator dump --compressed {_UI_DUMP_PATH}",
+    f"uiautomator dump {_UI_DUMP_PATH}",
+)
+
+# Common Bumble popups/interstitials that can be dismissed by tapping their
+# visible action text.
+_COMMON_POPUP_LABELS = ("Close", "Not now", "No thanks", "Maybe later", "Got it")
+
 
 def _parse_wm_size_output(out: str) -> tuple[int, int] | None:
     match = re.search(r"Physical size:\s*(\d+)x(\d+)", out)
@@ -807,8 +821,13 @@ class GeelarkADBDevice:
             return self._run_raw(cmd, timeout=timeout, text=text, check=check)
 
     def shell(self, *args: Any, timeout: float = 30.0, check: bool = True) -> str:
+        # Join into one quoted command string. Passing tokens separately lets the
+        # adb client concatenate them WITHOUT quoting, so `sh -c "input swipe ...;
+        # true"` reached the device as `sh -c input swipe ...` — sh took only
+        # `input` as its script and every gesture became a silent no-op.
+        command = " ".join(shlex.quote(str(arg)) for arg in args)
         out = self.adb(
-            ["shell", *[str(arg) for arg in args]],
+            ["shell", command],
             timeout=timeout,
             text=True,
             check=check,
@@ -2203,9 +2222,19 @@ def save_current_customer_snapshot(
     text_lines = _profile_text_lines(page_context)
     (profile_dir / "texts.txt").write_text("\n".join(text_lines), encoding="utf-8")
 
-    png = safe_screenshot_png(device)
-    (profile_dir / "screen.png").write_bytes(png)
-    save_png_crop(png, profile_dir / "photo.png", crop_bounds)
+    screen_name = ""
+    photo_name = ""
+    if isinstance(device, GeelarkOpenAPIShellDevice):
+        LOGGER.warning(
+            "Skipping customer screenshot for profile %s in OpenAPI shell mode; PNG transfer is too slow.",
+            index,
+        )
+    else:
+        png = safe_screenshot_png(device)
+        (profile_dir / "screen.png").write_bytes(png)
+        save_png_crop(png, profile_dir / "photo.png", crop_bounds)
+        screen_name = "screen.png"
+        photo_name = "photo.png"
 
     summary = {
         "index": index,
@@ -2213,8 +2242,8 @@ def save_current_customer_snapshot(
         "activity": page_context.activity,
         "inferred": page_context.inferred,
         "texts": text_lines,
-        "screen": "screen.png",
-        "photo": "photo.png",
+        "screen": screen_name,
+        "photo": photo_name,
     }
     (profile_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -2687,16 +2716,25 @@ def open_bumble_tab(device: Any, tab: str) -> None:
                     )
                 else:
                     raise AutomationError(f"Bumble main activity did not reach foreground; activity={activity}")
-    tab_points = {
-        "profile": (110, 2190),
-        "discover": (320, 2190),
-        "people": (540, 2190),
-        "liked": (760, 2190),
-        "chats": (970, 2190),
+    # Bottom-nav positions as screen-size fractions: five evenly spaced tabs
+    # centered at 10%/30%/50%/70%/90% of the width, ~93.5% of the height.
+    # Hardcoded pixels (1080x2340) mis-tapped the card photo on larger cloud
+    # phones such as 1216x2624.
+    tab_x_fractions = {
+        "profile": 0.10,
+        "discover": 0.30,
+        "people": 0.50,
+        "liked": 0.70,
+        "chats": 0.90,
     }
-    if tab not in tab_points:
+    if tab not in tab_x_fractions:
         raise AutomationError(f"Unsupported Bumble tab: {tab}")
-    x, y = tab_points[tab]
+    try:
+        width, height = device.get_screen_size()
+    except Exception:
+        width, height = 1080, 2340
+    x = int(width * tab_x_fractions[tab])
+    y = int(height * 0.935)
     if not _tap_bumble_bottom_nav_from_ui(device, tab):
         LOGGER.info("Tapping Bumble %s tab by fallback coordinates.", tab)
         human_gaussian_click(device, x, y, sigma_px=9.0, max_offset_px=28)
@@ -3469,11 +3507,8 @@ def _relative_point(screen_size: tuple[int, int], x_ratio: float, y_ratio: float
 
 def _extract_visible_text_values_fast(device: Any) -> list[str]:
     if isinstance(device, GeelarkOpenAPIShellDevice):
-        dump_path = "/sdcard/window_dump.xml"
-        for dump_cmd in (
-            f"uiautomator dump --compressed {dump_path}",
-            f"uiautomator dump {dump_path}",
-        ):
+        dump_path = _UI_DUMP_PATH
+        for dump_cmd in _UIAUTOMATOR_DUMP_COMMANDS:
             device._execute(dump_cmd, check=False)
             raw = _read_ui_dump_text_fast(device, dump_path)
             values = _parse_text_values_from_ui_dump(raw)
@@ -3497,7 +3532,7 @@ def _extract_visible_text_values_fast(device: Any) -> list[str]:
 
 def _extract_visible_ui_nodes_fast(device: Any, *, limit: int = 320) -> list[dict[str, Any]]:
     if isinstance(device, GeelarkOpenAPIShellDevice):
-        dump_path = "/sdcard/window_dump.xml"
+        dump_path = _UI_DUMP_PATH
         grep_patterns = (
             (
                 "resource",
@@ -3507,10 +3542,7 @@ def _extract_visible_ui_nodes_fast(device: Any, *, limit: int = 320) -> list[dic
             ),
             ("text", "text=\"[^\"]+\"|content-desc=\"[^\"]+\""),
         )
-        for dump_cmd in (
-            f"uiautomator dump --compressed {dump_path}",
-            f"uiautomator dump {dump_path}",
-        ):
+        for dump_cmd in _UIAUTOMATOR_DUMP_COMMANDS:
             device._execute(dump_cmd, check=False)
             collected: list[dict[str, Any]] = []
             for _label, pattern in grep_patterns:
@@ -3605,11 +3637,8 @@ def _text_values_from_nodes(nodes: Iterable[dict[str, Any]]) -> list[str]:
 
 
 def _dump_ui_xml_for_parse_fast(device: GeelarkOpenAPIShellDevice) -> str:
-    dump_path = "/sdcard/window_dump.xml"
-    for dump_cmd in (
-        f"uiautomator dump --compressed {dump_path}",
-        f"uiautomator dump {dump_path}",
-    ):
+    dump_path = _UI_DUMP_PATH
+    for dump_cmd in _UIAUTOMATOR_DUMP_COMMANDS:
         device._execute(dump_cmd, check=False)
         raw = _clean_ui_xml_text(device._execute(f"cat {dump_path}", check=False))
         if "<hierarchy" in raw:
@@ -3681,6 +3710,30 @@ def _click_visible_text_fast(device: Any, labels: Iterable[str]) -> str | None:
             human_gaussian_click(device, center[0], center[1], sigma_px=7.5, max_offset_px=22)
             return label
     return None
+
+
+def _dismiss_common_popups_fast(
+    device: Any,
+    *,
+    labels: Iterable[str] = _COMMON_POPUP_LABELS,
+    max_rounds: int = 2,
+) -> list[str]:
+    """Dismiss up to `max_rounds` stacked popups by tapping their action text.
+
+    Returns the list of labels that were tapped, in order. Bumble can queue a
+    second interstitial behind the first, so this taps repeatedly until nothing
+    dismissable remains or the round budget is spent.
+    """
+    labels = tuple(labels)
+    dismissed: list[str] = []
+    for _ in range(max_rounds):
+        label = _click_visible_text_fast(device, labels)
+        if not label:
+            break
+        dismissed.append(label)
+        LOGGER.info("Dismissed chat popup/action by text: %s.", label)
+        time.sleep(random.uniform(0.55, 1.0))
+    return dismissed
 
 
 def _find_text_center_by_remote_grep(
@@ -3892,13 +3945,16 @@ def _looks_like_bumble_chat_thread(values: Iterable[str], activity: str = "") ->
     text = "\n".join(value.strip().lower() for value in values if value and value.strip())
     normalized = {value.strip().lower() for value in values if value and value.strip()}
     activity_lower = activity.lower()
-    if _looks_like_bumble_chat_list(values):
-        return False
+    # ConversationActivity is authoritative: in-thread banners such as "You
+    # have 24 hours to reply" also match the chat-list heuristic, so the list
+    # check must not run first when the activity already says chat thread.
     if "conversation" in activity_lower:
         header_markers = {"view profile", "voice call", "video call"}
         if not normalized:
             return True
         return bool(normalized.intersection(header_markers)) or not _looks_like_bumble_profile_surface(values)
+    if _looks_like_bumble_chat_list(values):
+        return False
     if "profile" in activity_lower and "conversation" not in activity_lower:
         return False
     if _looks_like_bumble_profile_surface(values):
@@ -4614,6 +4670,12 @@ def _save_reply_state(state: dict[str, Any]) -> None:
             encoding="utf-8",
         )
         tmp_path.replace(path)
+
+
+def _append_jsonl_line(path: Path, entry: dict[str, Any]) -> None:
+    """Append one JSON object as a line to a JSONL run log (no added fields)."""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _append_reply_monitor_event(path: Path, event: dict[str, Any]) -> None:
@@ -5699,20 +5761,16 @@ def run_bumble_right_swipe_loop(
                     text_lines = _profile_text_lines(page_context)
                     if _looks_like_no_swipe_target(page_context):
                         LOGGER.info("No swipe target detected on screen; stopping loop.")
-                        with run_log.open("a", encoding="utf-8") as handle:
-                            handle.write(
-                                json.dumps(
-                                    {
-                                        "attempt": attempt_idx,
-                                        "event": "stop_no_swipe_target",
-                                        "profile_dir": str(profile_dir),
-                                        "texts": text_lines,
-                                        "successful_likes": successful_likes,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
+                        _append_jsonl_line(
+                            run_log,
+                            {
+                                "attempt": attempt_idx,
+                                "event": "stop_no_swipe_target",
+                                "profile_dir": str(profile_dir),
+                                "texts": text_lines,
+                                "successful_likes": successful_likes,
+                            },
+                        )
                         break
 
                     LOGGER.info(
@@ -5759,20 +5817,16 @@ def run_bumble_right_swipe_loop(
                     before_state = before_snapshot.get("state") or {}
                 if before_state.get("is_like_limit"):
                     LOGGER.info("Bumble like limit detected before swiping; stopping loop.")
-                    with run_log.open("a", encoding="utf-8") as handle:
-                        handle.write(
-                            json.dumps(
-                                {
-                                    "attempt": attempt_idx,
-                                    "event": "stop_like_limit",
-                                    "before_card": before_card,
-                                    "before_state": before_state,
-                                    "successful_likes": successful_likes,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
+                    _append_jsonl_line(
+                        run_log,
+                        {
+                            "attempt": attempt_idx,
+                            "event": "stop_like_limit",
+                            "before_card": before_card,
+                            "before_state": before_state,
+                            "successful_likes": successful_likes,
+                        },
+                    )
                     summary_result["status"] = "like_limit"
                     break
                 if before_state.get("is_no_target") or not before_card.get("has_card"):
@@ -5781,21 +5835,17 @@ def run_bumble_right_swipe_loop(
                             "No visible card before swiping, but no hard stop marker was found; retrying recovery."
                         )
                         total_errors += 1
-                        with run_log.open("a", encoding="utf-8") as handle:
-                            handle.write(
-                                json.dumps(
-                                    {
-                                        "attempt": attempt_idx,
-                                        "event": "recoverable_no_card_before_swipe",
-                                        "before_card": before_card,
-                                        "before_state": before_state,
-                                        "before_recovery_actions": before_recovery_actions,
-                                        "successful_likes": successful_likes,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
+                        _append_jsonl_line(
+                            run_log,
+                            {
+                                "attempt": attempt_idx,
+                                "event": "recoverable_no_card_before_swipe",
+                                "before_card": before_card,
+                                "before_state": before_state,
+                                "before_recovery_actions": before_recovery_actions,
+                                "successful_likes": successful_likes,
+                            },
+                        )
                         _write_run_summary(
                             run_summary,
                             profile_id=profile_id,
@@ -5817,20 +5867,16 @@ def run_bumble_right_swipe_loop(
                         time.sleep(random.uniform(0.8, 1.6))
                         continue
                     LOGGER.info("No swipe target card detected before swiping; stopping loop.")
-                    with run_log.open("a", encoding="utf-8") as handle:
-                        handle.write(
-                            json.dumps(
-                                {
-                                    "attempt": attempt_idx,
-                                    "event": "stop_no_swipe_target",
-                                    "before_card": before_card,
-                                    "before_state": before_state,
-                                    "successful_likes": successful_likes,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
+                    _append_jsonl_line(
+                        run_log,
+                        {
+                            "attempt": attempt_idx,
+                            "event": "stop_no_swipe_target",
+                            "before_card": before_card,
+                            "before_state": before_state,
+                            "successful_likes": successful_likes,
+                        },
+                    )
                     summary_result["status"] = "no_swipe_target"
                     break
 
@@ -5968,8 +6014,7 @@ def run_bumble_right_swipe_loop(
                     "daily_limit": config.DAILY_ACTION_LIMIT,
                     "next_wait_seconds": round(inter_wait, 3),
                 }
-                with run_log.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+                _append_jsonl_line(run_log, log_entry)
                 _write_run_summary(
                     run_summary,
                     profile_id=profile_id,
@@ -6031,21 +6076,17 @@ def run_bumble_right_swipe_loop(
                 )
                 handled = handle_common_popups(device, max_rounds=4)
                 total_popup_actions += len(handled)
-                with run_log.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        json.dumps(
-                            {
-                                "attempt": attempt_idx,
-                                "event": "iteration_error",
-                                "error": str(exc),
-                                "handled_popups": handled,
-                                "retry": consecutive_errors,
-                                "successful_likes": successful_likes,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
+                _append_jsonl_line(
+                    run_log,
+                    {
+                        "attempt": attempt_idx,
+                        "event": "iteration_error",
+                        "error": str(exc),
+                        "handled_popups": handled,
+                        "retry": consecutive_errors,
+                        "successful_likes": successful_likes,
+                    },
+                )
                 if consecutive_errors >= 3:
                     raise AutomationError(
                         f"Stopping after {consecutive_errors} consecutive iteration errors."
@@ -6060,6 +6101,236 @@ def run_bumble_right_swipe_loop(
             except Exception:
                 LOGGER.debug("Failed to stop cloud phone %s.", profile_id, exc_info=True)
     return summary_result
+
+
+_MATCH_CIRCLE_DESC_RE = re.compile(r"^(?P<name>.{1,48}?),\s*(?:date,\s*)?match$", re.IGNORECASE)
+
+_BUMBLE_FIRST_MOVE_BLOCKERS = (
+    "make the first move",
+    "makes the first move",
+    "get to make the first",
+    "24 hours to make",
+    "waiting for them",
+    "conversation expired",
+    "match expired",
+)
+
+
+def _find_your_matches_circle_entries(
+    nodes: Iterable[dict[str, Any]],
+    *,
+    screen_size: tuple[int, int],
+) -> list[dict[str, Any]]:
+    """Match circles in the "Your matches" carousel (content-desc "<name>, date, match")."""
+
+    width, height = screen_size
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for node in nodes:
+        desc = str(node.get("content_desc") or "").strip()
+        match = _MATCH_CIRCLE_DESC_RE.match(desc)
+        if not match:
+            continue
+        name = match.group("name").strip()
+        center = node.get("center")
+        if not name or center is None or name.lower() in {"50+", "likes you"}:
+            continue
+        x, y = int(center[0]), int(center[1])
+        if not (0 < x < width) or y > height * 0.45:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({"name": name, "center": (x, y)})
+    return entries
+
+
+def _bumble_chat_input_available(nodes: Iterable[dict[str, Any]]) -> bool:
+    for node in nodes:
+        if str(node.get("class") or "") == "android.widget.EditText":
+            return True
+        value = " ".join(
+            str(node.get(key) or "") for key in ("text", "content_desc")
+        ).strip().lower()
+        if value.startswith(("send a message", "type a message", "write a message")):
+            return True
+        resource_id = str(node.get("resource_id") or "").lower()
+        if resource_id.endswith(("chat_input", "message_input", "composer_input")):
+            return True
+    return False
+
+
+def _expand_bumble_older_chats(device: Any, nodes: Iterable[dict[str, Any]]) -> bool:
+    """Tap a collapsed "Older chats" header so its rows join the scan."""
+
+    for node in nodes:
+        if str(node.get("text") or "").strip().lower() != "older chats":
+            continue
+        center = node.get("center")
+        if center is None:
+            continue
+        LOGGER.info(
+            "Expanding collapsed Older chats section at (%s, %s).",
+            int(center[0]),
+            int(center[1]),
+        )
+        human_gaussian_click(
+            device, int(center[0]), int(center[1]), sigma_px=6.0, max_offset_px=16
+        )
+        time.sleep(random.uniform(1.0, 1.6))
+        return True
+    return False
+
+
+def _process_your_matches_openers(
+    device: Any,
+    config: Config,
+    *,
+    output_dir: Path,
+    screen_size: tuple[int, int],
+    monitor_path: Path,
+    profile_id: str,
+    send_ai_replies: bool,
+    target_location: str,
+    heat_threshold: int,
+    max_matches: int = 6,
+) -> list[dict[str, Any]]:
+    """Open each "Your matches" circle and send an AI opener where messaging is allowed."""
+
+    matches_dir = output_dir / "match_openers"
+    matches_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = _collect_visible_text_snapshot(
+        device, label="your_matches_scan", output_dir=matches_dir
+    )
+    entries = _find_your_matches_circle_entries(
+        snapshot["nodes"], screen_size=screen_size
+    )
+    results: list[dict[str, Any]] = []
+    if not entries:
+        return results
+    LOGGER.info(
+        "Checking %s match circle(s) from Your matches for message availability.",
+        len(entries),
+    )
+    reply_state = _load_reply_state(config)
+    sent_state = reply_state.setdefault("sent", {})
+    for entry in entries[:max_matches]:
+        name = str(entry["name"])
+        state_key = f"match_opener::{profile_id}::{name.lower()}"
+        result: dict[str, Any] = {"name": name, "status": "checked"}
+        results.append(result)
+        if state_key in sent_state:
+            result["status"] = "skipped_already_sent"
+            continue
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "match"
+        match_dir = matches_dir / safe_name
+        match_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            x, y = entry["center"]
+            human_gaussian_click(device, x, y, sigma_px=6.0, max_offset_px=18)
+            time.sleep(random.uniform(1.6, 2.6))
+            chat_snapshot = _collect_visible_text_snapshot(
+                device, label="match_chat", output_dir=match_dir
+            )
+            texts_lower = " ".join(chat_snapshot["texts"]).lower()
+            blocker = next(
+                (b for b in _BUMBLE_FIRST_MOVE_BLOCKERS if b in texts_lower), ""
+            )
+            can_message = (
+                _bumble_chat_input_available(chat_snapshot["nodes"]) and not blocker
+            )
+            result["can_message"] = can_message
+            if blocker:
+                result["blocker"] = blocker
+            LOGGER.info(
+                "Match %s: can_message=%s%s.",
+                name,
+                can_message,
+                f" (blocker: {blocker})" if blocker else "",
+            )
+            _append_reply_monitor_event(
+                monitor_path,
+                {
+                    "event": "match_opener_checked",
+                    "profile_id": profile_id,
+                    "match_name": name,
+                    "can_message": can_message,
+                    "blocker": blocker,
+                },
+            )
+            if can_message and send_ai_replies:
+                ai_result = _call_bumble_reply_ai(
+                    config,
+                    self_profile_text="",
+                    customer_profile_text="\n".join(chat_snapshot["texts"]),
+                    conversation_text=(
+                        "(brand-new match, no messages yet — send a short, natural "
+                        "opener based on the visible profile context)"
+                    ),
+                    chat_title=name,
+                    image_path=None,
+                    target_location=target_location,
+                    heat_threshold=heat_threshold,
+                    output_dir=match_dir,
+                )
+                raw_parts = [
+                    str(part).strip()
+                    for part in ai_result.get("reply_parts", [])
+                    if str(part).strip()
+                ]
+                if not raw_parts and str(ai_result.get("reply") or "").strip():
+                    raw_parts = [str(ai_result["reply"]).strip()]
+                reply_parts = [
+                    _prepare_reply_for_device_text(
+                        part, allow_unicode=bool(config.USE_ADB_KEYBOARD)
+                    )
+                    for part in raw_parts
+                ]
+                reply_parts = [part for part in reply_parts if part][:1]
+                if not reply_parts:
+                    result["status"] = "skipped_ai_empty_reply"
+                else:
+                    send_result = _send_bumble_reply_parts(
+                        device,
+                        screen_size=screen_size,
+                        reply_parts=reply_parts,
+                        chat_dir=match_dir,
+                    )
+                    if bool(send_result.get("verified_visible")):
+                        result["status"] = "opener_sent"
+                        result["reply_parts"] = reply_parts
+                        sent_state[state_key] = {
+                            "profile_id": profile_id,
+                            "chat_title": name,
+                            "reply_parts": reply_parts,
+                            "kind": "match_opener",
+                            "sent_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                        _save_reply_state(reply_state)
+                        LOGGER.info("Sent AI opener to match %s: %s", name, reply_parts)
+                    else:
+                        result["status"] = "send_unverified"
+                    _append_reply_monitor_event(
+                        monitor_path,
+                        {
+                            "event": "match_opener_send_completed",
+                            "profile_id": profile_id,
+                            "match_name": name,
+                            "status": result["status"],
+                            "reply_parts": reply_parts,
+                        },
+                    )
+        except Exception as exc:
+            LOGGER.warning("Match opener flow failed for %s: %s", name, exc)
+            result["status"] = "error"
+            result["error"] = str(exc)
+        finally:
+            for _ in range(2):
+                device.shell("input", "keyevent", "BACK", timeout=6, check=False)
+                time.sleep(random.uniform(0.4, 0.8))
+            open_bumble_tab(device, "chats")
+    return results
 
 
 def run_bumble_chat_capture(
@@ -6213,20 +6484,7 @@ def run_bumble_chat_capture(
             monitor_path,
             {"event": "chats_tab_opened", "profile_id": profile_id},
         )
-        dismissed = _click_visible_text_fast(
-            device,
-            ("Close", "Not now", "No thanks", "Maybe later", "Got it"),
-        )
-        if dismissed:
-            LOGGER.info("Dismissed chat popup/action by text: %s.", dismissed)
-            time.sleep(random.uniform(0.55, 1.0))
-            dismissed_again = _click_visible_text_fast(
-                device,
-                ("Close", "Not now", "No thanks", "Maybe later", "Got it"),
-            )
-            if dismissed_again:
-                LOGGER.info("Dismissed second chat popup/action by text: %s.", dismissed_again)
-                time.sleep(random.uniform(0.55, 1.0))
+        _dismiss_common_popups_fast(device)
 
         chat_list_dir = output_dir / "chat_list"
         chat_list_dir.mkdir(parents=True, exist_ok=True)
@@ -6399,6 +6657,129 @@ def run_bumble_chat_capture(
                 "chat_list_dir": str(chat_list_dir),
             },
         )
+        if candidates and not list_only:
+            # Below-fold sweep: "Your move" rows pushed down by fresh matches
+            # never become candidates from the first viewport alone. Scroll a
+            # few screens, merging what appears, then reset to the top so
+            # first-attempt tap coordinates stay valid.
+            known_labels = {
+                str(candidate.get("label") or "").strip().lower()
+                for candidate in candidates
+            }
+            for sweep_idx in range(1, 7):
+                human_bezier_swipe(
+                    device,
+                    _relative_point(screen_size, 0.50, 0.78),
+                    _relative_point(screen_size, 0.50, 0.35),
+                    min_intermediate_points=15,
+                    total_duration_ms=random.randint(580, 880),
+                    use_motion_events=_prefer_motion_events(device),
+                )
+                time.sleep(random.uniform(0.55, 1.0))
+                below_fold_snapshot = _collect_visible_text_snapshot(
+                    device,
+                    label=f"chat_list_below_fold_{sweep_idx}",
+                    output_dir=chat_list_dir,
+                )
+                if not _snapshot_looks_like_bumble_chat_list(below_fold_snapshot):
+                    break
+                extra_candidates = [
+                    candidate
+                    for candidate in _find_chat_list_candidates(
+                        below_fold_snapshot["nodes"],
+                        screen_size=screen_size,
+                    )
+                    if str(candidate.get("label") or "").strip().lower()
+                    not in known_labels
+                ]
+                for candidate in extra_candidates:
+                    candidate["below_fold"] = True
+                    known_labels.add(
+                        str(candidate.get("label") or "").strip().lower()
+                    )
+                if extra_candidates:
+                    LOGGER.info(
+                        "Below-fold sweep %s added %s chat candidate(s): %s",
+                        sweep_idx,
+                        len(extra_candidates),
+                        [str(c.get("label") or "") for c in extra_candidates[:8]],
+                    )
+                    candidates = candidates + extra_candidates
+                elif sweep_idx > 1:
+                    break
+                older_header = next(
+                    (
+                        c
+                        for c in extra_candidates
+                        if str(c.get("label") or "").strip().lower()
+                        == "older chats"
+                    ),
+                    None,
+                )
+                if (
+                    older_header is not None
+                    and "expired"
+                    not in " ".join(below_fold_snapshot["texts"]).lower()
+                ):
+                    point = (
+                        older_header.get("click_center")
+                        or older_header.get("node_center")
+                    )
+                    if point:
+                        LOGGER.info(
+                            "Expanding Older chats during below-fold sweep at %s.",
+                            tuple(point),
+                        )
+                        human_gaussian_click(
+                            device,
+                            int(point[0]),
+                            int(point[1]),
+                            sigma_px=6.0,
+                            max_offset_px=16,
+                        )
+                        time.sleep(random.uniform(1.0, 1.6))
+                        # The expanded rows render below the header, usually
+                        # past the viewport bottom — scroll once to see them.
+                        human_bezier_swipe(
+                            device,
+                            _relative_point(screen_size, 0.50, 0.78),
+                            _relative_point(screen_size, 0.50, 0.40),
+                            min_intermediate_points=15,
+                            total_duration_ms=random.randint(580, 880),
+                            use_motion_events=_prefer_motion_events(device),
+                        )
+                        time.sleep(random.uniform(0.55, 1.0))
+                        older_snapshot = _collect_visible_text_snapshot(
+                            device,
+                            label=f"chat_list_below_fold_{sweep_idx}_older",
+                            output_dir=chat_list_dir,
+                        )
+                        older_rows = [
+                            candidate
+                            for candidate in _find_chat_list_candidates(
+                                older_snapshot["nodes"],
+                                screen_size=screen_size,
+                            )
+                            if str(candidate.get("label") or "").strip().lower()
+                            not in known_labels
+                        ]
+                        for candidate in older_rows:
+                            candidate["below_fold"] = True
+                            known_labels.add(
+                                str(candidate.get("label") or "").strip().lower()
+                            )
+                        if older_rows:
+                            LOGGER.info(
+                                "Older chats expansion added %s candidate(s): %s",
+                                len(older_rows),
+                                [str(c.get("label") or "") for c in older_rows[:8]],
+                            )
+                            candidates = candidates + older_rows
+            open_bumble_tab(device, "chats")
+            # Rows that need a reply should consume max_chats slots first.
+            candidates.sort(
+                key=lambda c: 0 if _candidate_row_needs_reply(c) else 1
+            )
         if not candidates:
             LOGGER.info("No readable chat rows found; scrolling chat list once before fallback.")
             human_bezier_swipe(
@@ -6433,6 +6814,62 @@ def run_bumble_chat_capture(
                     "chat_list_dir": str(chat_list_dir),
                 },
             )
+        if not list_only:
+            snapshot_texts_lower = " ".join(chat_list_snapshot["texts"]).lower()
+            # A collapsed "Older chats" section can hide actionable "Your move"
+            # rows; expand it once (expired-row text visible means already open).
+            # Expand regardless of other pending rows — waiting for a quiet
+            # list starves Older-chats messages while new chats keep arriving.
+            if (
+                "older chats" in snapshot_texts_lower
+                and "expired" not in snapshot_texts_lower
+                and _expand_bumble_older_chats(device, chat_list_snapshot["nodes"])
+            ):
+                chat_list_snapshot = _collect_visible_text_snapshot(
+                    device,
+                    label="chat_list_older_expanded",
+                    output_dir=chat_list_dir,
+                )
+                expanded_candidates = _find_chat_list_candidates(
+                    chat_list_snapshot["nodes"],
+                    screen_size=screen_size,
+                )
+                if not any(
+                    _candidate_row_needs_reply(candidate)
+                    for candidate in expanded_candidates
+                ):
+                    human_bezier_swipe(
+                        device,
+                        _relative_point(screen_size, 0.50, 0.78),
+                        _relative_point(screen_size, 0.50, 0.42),
+                        min_intermediate_points=15,
+                        total_duration_ms=random.randint(580, 880),
+                        use_motion_events=_prefer_motion_events(device),
+                    )
+                    time.sleep(random.uniform(0.55, 1.0))
+                    chat_list_snapshot = _collect_visible_text_snapshot(
+                        device,
+                        label="chat_list_older_expanded_scrolled",
+                        output_dir=chat_list_dir,
+                    )
+                    expanded_candidates = _find_chat_list_candidates(
+                        chat_list_snapshot["nodes"],
+                        screen_size=screen_size,
+                    )
+                if expanded_candidates:
+                    candidates = expanded_candidates
+                _append_reply_monitor_event(
+                    monitor_path,
+                    {
+                        "event": "older_chats_expanded",
+                        "profile_id": profile_id,
+                        "candidate_count": len(candidates),
+                        "candidate_labels": [
+                            str(candidate.get("label") or "")
+                            for candidate in candidates[:8]
+                        ],
+                    },
+                )
         if (
             send_ai_replies
             and not list_only
@@ -6560,6 +6997,18 @@ def run_bumble_chat_capture(
             encoding="utf-8",
         )
         if not candidates and _looks_like_empty_bumble_chat_list(chat_list_snapshot["texts"]):
+            if not list_only:
+                summary["match_openers"] = _process_your_matches_openers(
+                    device,
+                    config,
+                    output_dir=output_dir,
+                    screen_size=screen_size,
+                    monitor_path=monitor_path,
+                    profile_id=profile_id,
+                    send_ai_replies=send_ai_replies,
+                    target_location=target_location,
+                    heat_threshold=heat_threshold,
+                )
             summary.update(
                 {
                     "status": "no_chat_candidates",
@@ -6585,6 +7034,18 @@ def run_bumble_chat_capture(
             )
             return summary
         if not candidates:
+            if not list_only:
+                summary["match_openers"] = _process_your_matches_openers(
+                    device,
+                    config,
+                    output_dir=output_dir,
+                    screen_size=screen_size,
+                    monitor_path=monitor_path,
+                    profile_id=profile_id,
+                    send_ai_replies=send_ai_replies,
+                    target_location=target_location,
+                    heat_threshold=heat_threshold,
+                )
             summary.update(
                 {
                     "status": "no_chat_candidates",
@@ -6756,9 +7217,27 @@ def run_bumble_chat_capture(
                     },
                 )
                 return summary
-            candidates = _find_chat_list_candidates(
+            fresh_after_self_profile = _find_chat_list_candidates(
                 chat_list_snapshot["nodes"],
                 screen_size=screen_size,
+            )
+            # Keep below-fold candidates from the pre-self-profile sweep:
+            # this recapture only sees the first viewport, and dropping them
+            # here silently lost older "Your move" rows.
+            fresh_labels = {
+                str(candidate.get("label") or "").strip().lower()
+                for candidate in fresh_after_self_profile
+            }
+            carried_below_fold = [
+                candidate
+                for candidate in candidates
+                if bool(candidate.get("below_fold"))
+                and str(candidate.get("label") or "").strip().lower()
+                not in fresh_labels
+            ]
+            candidates = fresh_after_self_profile + carried_below_fold
+            candidates.sort(
+                key=lambda c: 0 if _candidate_row_needs_reply(c) else 1
             )
             (chat_list_dir / "candidates_after_self_profile.json").write_text(
                 json.dumps(candidates, ensure_ascii=False, indent=2),
@@ -6873,6 +7352,7 @@ def run_bumble_chat_capture(
                 ),
                 "needs_reply_from_list": _candidate_row_needs_reply(candidate),
                 "row_context": list(candidate.get("row_context") or []),
+                "below_fold": bool(candidate.get("below_fold")),
             }
             for candidate in actionable_candidates[: max(1, max_chats * 3)]
         ]
@@ -6925,7 +7405,9 @@ def run_bumble_chat_capture(
                 attempt["label"],
                 attempt["point"],
             )
-            if attempt_idx > 1 and str(attempt.get("source") or "") == "candidate":
+            if (
+                attempt_idx > 1 or bool(attempt.get("below_fold"))
+            ) and str(attempt.get("source") or "") == "candidate":
                 current_activity = device.get_current_activity()
                 if "com.bumble.app/" not in current_activity:
                     LOGGER.info(
@@ -6986,6 +7468,77 @@ def run_bumble_chat_capture(
                     ),
                     None,
                 )
+                # The row may sit several screens under the fold (fresh
+                # matches push older chats down); scroll and rescan up to
+                # three screens before declaring the candidate stale.
+                for _retry_scroll in range(5):
+                    if fresh_match is not None:
+                        break
+                    human_bezier_swipe(
+                        device,
+                        _relative_point(screen_size, 0.50, 0.78),
+                        _relative_point(screen_size, 0.50, 0.35),
+                        min_intermediate_points=15,
+                        total_duration_ms=random.randint(580, 880),
+                        use_motion_events=_prefer_motion_events(device),
+                    )
+                    time.sleep(random.uniform(0.55, 1.0))
+                    fresh_snapshot = _collect_visible_text_snapshot(
+                        device,
+                        label=f"before_attempt_{attempt_idx}_scrolled_{_retry_scroll + 1}",
+                        output_dir=fresh_chat_list_dir,
+                    )
+                    fresh_candidates = _find_chat_list_candidates(
+                        fresh_snapshot["nodes"],
+                        screen_size=screen_size,
+                    )
+                    fresh_match = next(
+                        (
+                            candidate
+                            for candidate in fresh_candidates
+                            if _chat_candidate_matches_label(candidate, wanted_label)
+                            and (
+                                _candidate_row_needs_reply(candidate)
+                                if attempt_requires_list_need
+                                else _candidate_is_recent_chat_row(candidate)
+                            )
+                        ),
+                        None,
+                    )
+                    if fresh_match is None:
+                        # The target may live inside a re-collapsed "Older
+                        # chats" section; expand it and let the loop rescan.
+                        older_header = next(
+                            (
+                                c
+                                for c in fresh_candidates
+                                if str(c.get("label") or "").strip().lower()
+                                == "older chats"
+                            ),
+                            None,
+                        )
+                        if (
+                            older_header is not None
+                            and "expired"
+                            not in " ".join(fresh_snapshot["texts"]).lower()
+                        ):
+                            point = (
+                                older_header.get("click_center")
+                                or older_header.get("node_center")
+                            )
+                            if point:
+                                LOGGER.info(
+                                    "Expanding Older chats during rescan for %s.",
+                                    wanted_label,
+                                )
+                                human_gaussian_click(
+                                    device,
+                                    int(point[0]),
+                                    int(point[1]),
+                                    sigma_px=6.0,
+                                    max_offset_px=16,
+                                )
+                                time.sleep(random.uniform(1.0, 1.6))
                 if fresh_match is None:
                     LOGGER.info(
                         "Skipping stale candidate %s; it no longer matched after list rescan.",
@@ -7699,6 +8252,18 @@ def run_bumble_chat_capture(
                         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     }
                 )
+        if not list_only:
+            summary["match_openers"] = _process_your_matches_openers(
+                device,
+                config,
+                output_dir=output_dir,
+                screen_size=screen_size,
+                monitor_path=monitor_path,
+                profile_id=profile_id,
+                send_ai_replies=send_ai_replies,
+                target_location=target_location,
+                heat_threshold=heat_threshold,
+            )
         reply_audit_paths = _write_reply_audit_files(output_dir, reply_audit)
         unreplied_audit = _reply_audit_needs_attention(reply_audit)
         summary.update(

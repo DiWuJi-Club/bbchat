@@ -7,6 +7,9 @@
 diagnostics/
 *.log
 
+# Downloaded Android platform-tools (adb binary)
+tools/platform-tools/
+
 # Python
 __pycache__/
 *.py[cod]
